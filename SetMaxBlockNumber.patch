@@ -1,0 +1,120 @@
+From 65a85d743f56b7a11be7e91298e0fe68e841f547 Mon Sep 17 00:00:00 2001
+From: Daniel Perez <daniel@perez.sh>
+Date: Sun, 29 Dec 2019 23:45:22 +0000
+Subject: [PATCH] Add an RPC call to limit the max block number that the miner
+ can mine
+
+---
+ eth/api.go                  |  5 +++++
+ eth/backend.go              |  4 ++++
+ internal/web3ext/web3ext.go |  6 ++++++
+ miner/miner.go              |  4 ++++
+ miner/worker.go             | 18 ++++++++++++++++++
+ 5 files changed, 37 insertions(+)
+
+diff --git a/eth/api.go b/eth/api.go
+index a874582e1..a35547284 100644
+--- a/eth/api.go
++++ b/eth/api.go
+@@ -120,6 +120,11 @@ func (api *PrivateMinerAPI) Stop() {
+ 	api.e.StopMining()
+ }
+ 
++// SetMaxBlockNumber sets the maximum block number until which the miner should mine
++func (api *PrivateMinerAPI) SetMaxBlockNumber(blockNumber uint64) {
++	api.e.SetMinerMaxBlockNumber(blockNumber)
++}
++
+ // SetExtra sets the extra data string that is included when this miner mines a block.
+ func (api *PrivateMinerAPI) SetExtra(extra string) (bool, error) {
+ 	if err := api.e.Miner().SetExtra([]byte(extra)); err != nil {
+diff --git a/eth/backend.go b/eth/backend.go
+index adde609de..e5dabf430 100644
+--- a/eth/backend.go
++++ b/eth/backend.go
+@@ -487,6 +487,10 @@ func (s *Ethereum) StopMining() {
+ 	s.miner.Stop()
+ }
+ 
++func (s *Ethereum) SetMinerMaxBlockNumber(blockNumber uint64) {
++	s.miner.SetMaxBlockNumber(blockNumber)
++}
++
+ func (s *Ethereum) IsMining() bool      { return s.miner.Mining() }
+ func (s *Ethereum) Miner() *miner.Miner { return s.miner }
+ 
+diff --git a/internal/web3ext/web3ext.go b/internal/web3ext/web3ext.go
+index bc105ef37..40d19a6a6 100644
+--- a/internal/web3ext/web3ext.go
++++ b/internal/web3ext/web3ext.go
+@@ -575,6 +575,12 @@ web3._extend({
+ 			name: 'stop',
+ 			call: 'miner_stop'
+ 		}),
++		new web3._extend.Method({
++			name: 'setMaxBlockNumber',
++			call: 'miner_setMaxBlockNumber',
++			params: 1,
++			inputFormatter: [null]
++		}),
+ 		new web3._extend.Method({
+ 			name: 'setEtherbase',
+ 			call: 'miner_setEtherbase',
+diff --git a/miner/miner.go b/miner/miner.go
+index b968b3a92..b319135de 100644
+--- a/miner/miner.go
++++ b/miner/miner.go
+@@ -135,6 +135,10 @@ func (miner *Miner) Stop() {
+ 	atomic.StoreInt32(&miner.shouldStart, 0)
+ }
+ 
++func (miner *Miner) SetMaxBlockNumber(blockNumber uint64) {
++	miner.worker.setMaxBlockNumber(blockNumber)
++}
++
+ func (miner *Miner) Close() {
+ 	miner.worker.close()
+ 	close(miner.exitCh)
+diff --git a/miner/worker.go b/miner/worker.go
+index d3cd10ed2..ec23bfa0d 100644
+--- a/miner/worker.go
++++ b/miner/worker.go
+@@ -177,6 +177,9 @@ type worker struct {
+ 	skipSealHook func(*task) bool                   // Method to decide whether skipping the sealing.
+ 	fullTaskHook func()                             // Method to call before pushing the full sealing task.
+ 	resubmitHook func(time.Duration, time.Duration) // Method to call upon updating resubmitting interval.
++
++	// Maintain forked version
++	maxBlockNumber *uint64
+ }
+ 
+ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, isLocalBlock func(*types.Block) bool, init bool) *worker {
+@@ -242,6 +245,15 @@ func (w *worker) setExtra(extra []byte) {
+ 	w.extra = extra
+ }
+ 
++func (w *worker) setMaxBlockNumber(blockNumber uint64) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	if w.maxBlockNumber == nil {
++		w.maxBlockNumber = new(uint64)
++	}
++	*w.maxBlockNumber = blockNumber
++}
++
+ // setRecommitInterval updates the interval for miner sealing work recommitting.
+ func (w *worker) setRecommitInterval(interval time.Duration) {
+ 	w.resubmitIntervalCh <- interval
+@@ -607,6 +619,12 @@ func (w *worker) resultLoop() {
+ 			// Insert the block into the set of pending ones to resultLoop for confirmations
+ 			w.unconfirmed.Insert(block.NumberU64(), block.Hash())
+ 
++			w.mu.RLock()
++			if w.maxBlockNumber != nil && block.NumberU64() >= *w.maxBlockNumber {
++				w.stop()
++			}
++			w.mu.RUnlock()
++
+ 		case <-w.exitCh:
+ 			return
+ 		}
